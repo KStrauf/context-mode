@@ -19,7 +19,9 @@ import {
   evaluateCommandDenyOnly,
   extractShellCommands,
   readToolDenyPatterns,
+  readToolPermissionPatterns,
   evaluateFilePath,
+  evaluateProjectContainment,
 } from "./security.js";
 import {
   detectRuntimes,
@@ -28,7 +30,7 @@ import {
   hasBunRuntime,
 } from "./runtime.js";
 import { classifyNonZeroExit } from "./exit-classify.js";
-import { startLifecycleGuard } from "./lifecycle.js";
+import { startLifecycleGuard, noteMcpActivity, noteRequestStart, noteRequestEnd, attachMcpActivityTap } from "./lifecycle.js";
 import { charSafePrefix } from "./truncate.js";
 import {
   describeStorageDirectorySource,
@@ -293,6 +295,10 @@ function wrapToolHandler(
   handler: (toolArgs: Record<string, unknown>) => Promise<unknown> | unknown,
 ): (toolArgs: Record<string, unknown>) => Promise<unknown> {
   return async (toolArgs: Record<string, unknown>) => {
+    // #854: mark a tool call in-flight so the bridge-child idle reaper never
+    // shuts the server down mid-execution during a long ctx_execute/batch that
+    // emits no further inbound messages. Symmetric end in finally (success+error).
+    noteRequestStart();
     try {
       return await handler(toolArgs);
     } catch (err) {
@@ -306,6 +312,8 @@ function wrapToolHandler(
         }
       }
       throw err;
+    } finally {
+      noteRequestEnd();
     }
   };
 }
@@ -874,6 +882,9 @@ function healCacheMidSession(): void {
 }
 
 function trackResponse(toolName: string, response: ToolResult): ToolResult {
+  // #854: a response is activity too — refresh the bridge-child idle clock so a
+  // chatty/streaming call keeps its server alive even between inbound frames.
+  noteMcpActivity();
   // Mid-session cache heal — one-shot, first tool call
   healCacheMidSession();
   // Prepend version outdated warning if needed
@@ -1134,6 +1145,53 @@ function checkNonShellDenyPolicy(
     }
   } catch {
     // Fail-open
+  }
+  return null;
+}
+
+/**
+ * Issue #852 — project-boundary containment for `ctx_execute_file`.
+ *
+ * The harness sandbox (Claude Code, etc.) cannot inspect MCP input params, so a
+ * user approving a `ctx_execute_file` call cannot see that its `path` escapes
+ * the workspace. This guard refuses a `path` that resolves outside the project
+ * root (absolute escape, `../` traversal, or symlink-out), restoring the
+ * boundary the host believes it is enforcing.
+ *
+ * Escape hatch — NO bespoke opt-out env. A deliberate out-of-project read is
+ * expressed in the SAME host config the user already maintains: a
+ * `permissions.allow` rule like `Read(/var/log/**)`. This reuses the exact
+ * mechanism Claude Code uses to whitelist a path outside its sandbox, so the
+ * grant lives in one place and stays meaningful instead of rotting into a
+ * context-mode-only env flag nobody sets.
+ *
+ * Fail-open on resolver failure (consistent with the other deny checks): if the
+ * project root cannot be resolved, containment evaluates as "inside" and the
+ * path is allowed through rather than spuriously blocking legitimate work.
+ */
+function checkProjectBoundary(
+  filePath: string,
+  toolName: string,
+): ToolResult | null {
+  try {
+    const projectDir = getProjectDir();
+    const allowGlobs = readToolPermissionPatterns("Read", "allow", projectDir);
+    const verdict = evaluateProjectContainment(filePath, projectDir, allowGlobs);
+    if (verdict.allowed) return null;
+    return trackResponse(toolName, {
+      content: [{
+        type: "text" as const,
+        text:
+          `File access blocked: "${filePath}" resolves outside the project root ` +
+          `(${projectDir}). context-mode confines ${toolName} to the workspace so it ` +
+          `cannot be used to bypass the host's sandbox/permission controls (issue #852). ` +
+          `To intentionally process a file outside the project, add a host allow rule, ` +
+          `e.g. "permissions": { "allow": ["Read(${filePath})"] } in your settings.`,
+      }],
+      isError: true,
+    });
+  } catch {
+    // Fail-open — resolver failure must not block legitimate in-project work.
   }
   return null;
 }
@@ -1577,7 +1635,9 @@ export async function runBatchCommands(
 server.registerTool(
   "ctx_execute",
   {
-    title: "Execute Code",
+    // #852: surface code execution in the host approval prompt's title (the
+    // only server-controlled field the MCP permission UI renders besides args).
+    title: "Run code in a sandbox (executes the supplied code)",
     // #846: runs arbitrary code in a sandbox with full network access.
     annotations: {
       readOnlyHint: false,
@@ -1970,7 +2030,10 @@ function intentSearch(
 server.registerTool(
   "ctx_execute_file",
   {
-    title: "Execute File Processing",
+    // #852: the host's MCP approval prompt renders only the tool name/title +
+    // raw args — the title is the one server-controlled signal, so make it
+    // unambiguously announce code execution + file read for the reviewer.
+    title: "Run code over a file (executes code, reads the given path)",
     // #846: runs arbitrary code over a file in a sandbox with full network access.
     annotations: {
       readOnlyHint: false,
@@ -2037,6 +2100,12 @@ EXAMPLE: ctx_execute_file(path: "data.csv", language: "javascript", code: "const
     }),
   },
   async ({ path, language, code, timeout, intent }) => {
+    // Security (#852): confine the processed file to the project root so
+    // ctx_execute_file cannot be used to escape the host's sandbox/permission
+    // controls. Runs before the deny-glob check — boundary first, then policy.
+    const boundaryDenied = checkProjectBoundary(path, "ctx_execute_file");
+    if (boundaryDenied) return boundaryDenied;
+
     // Security: check file path against Read deny patterns
     const pathDenied = checkFilePathDenyPolicy(path, "ctx_execute_file");
     if (pathDenied) return pathDenied;
@@ -4803,6 +4872,13 @@ async function main() {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
+
+  // #854: refresh the bridge-child idle clock on each inbound MCP message so an
+  // abandoned bridge child (CONTEXT_MODE_BRIDGE_DEPTH>0) self-terminates instead
+  // of accumulating under a long-lived Pi/omp parent. Best-effort; no stdin touch.
+  attachMcpActivityTap(
+    transport as unknown as { onmessage?: (message: unknown, extra?: unknown) => unknown },
+  );
 
   // Write MCP readiness sentinel (#230)
   try { writeFileSync(mcpSentinel, String(process.pid)); } catch { /* best effort */ }
