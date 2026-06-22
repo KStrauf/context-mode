@@ -487,21 +487,51 @@ import "./hooks/ensure-deps.mjs";
   const NPM_INSTALL_BG_PKGS = ["turndown", "turndown-plugin-gfm", "@mixmark-io/domino"];
   const IS_WIN32 = process.platform === "win32";
   const NPM_BIN = IS_WIN32 ? "npm.cmd" : "npm";
+  const NPM_FLAGS = ["--no-package-lock", "--no-save", "--silent", "--no-audit", "--no-fund"];
+  // #861: on Windows the npm shim is `npm.cmd`, which needs `shell: true` to
+  // run — but Node DROPS the `cwd` option when `shell: true`, so the spawned
+  // cmd.exe inherits an arbitrary working dir (C:\Windows under Claude Code).
+  // `npm install` then tries to create `C:\Windows\node_modules` → EPERM on
+  // every boot, and a cmd.exe window flashes each time. Prefer running npm's
+  // own CLI through node directly (no `.cmd` shim, no shell): `shell: false`
+  // honors `cwd` and `windowsHide` suppresses the console window. Fall back to
+  // the shim only when npm-cli.js can't be located, so a working host (e.g. a
+  // POSIX layout where npm-cli.js isn't beside node) can never regress.
+  const NPM_CLI_JS = resolve(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
+  const useNodeCli = existsSync(NPM_CLI_JS);
   for (const pkg of NPM_INSTALL_BG_PKGS) {
     if (existsSync(resolve(__dirname, "node_modules", pkg))) continue;
     try {
-      const child = spawn(
-        NPM_BIN,
-        ["install", pkg, "--no-package-lock", "--no-save", "--silent", "--no-audit", "--no-fund"],
-        {
-          cwd: __dirname,
-          stdio: "ignore",
-          detached: true,
-          // npm on Windows ships as a `.cmd` shim — must go through cmd.exe.
-          shell: IS_WIN32,
-        },
-      );
-      child.on("error", () => { /* best effort — npm missing, broken cache, etc. */ });
+      const child = useNodeCli
+        ? spawn(process.execPath, [NPM_CLI_JS, "install", pkg, ...NPM_FLAGS], {
+            cwd: __dirname,
+            stdio: "ignore",
+            detached: true,
+            shell: false,
+            windowsHide: true,
+          })
+        : spawn(NPM_BIN, ["install", pkg, ...NPM_FLAGS], {
+            cwd: __dirname,
+            stdio: "ignore",
+            detached: true,
+            // npm on Windows ships as a `.cmd` shim — must go through cmd.exe.
+            shell: IS_WIN32,
+            windowsHide: true,
+          });
+      // #861: this EPERM was invisible for months behind stdio:"ignore" + an
+      // empty error handler. Surface both spawn failures and non-zero exits.
+      child.on("error", (err) => {
+        process.stderr.write(
+          `[context-mode] background install of ${pkg} failed to spawn: ${err?.message ?? err}\n`,
+        );
+      });
+      child.on("exit", (code) => {
+        if (code) {
+          process.stderr.write(
+            `[context-mode] background install of ${pkg} exited with code ${code}\n`,
+          );
+        }
+      });
       child.unref();
     } catch { /* best effort — never block MCP boot */ }
   }
